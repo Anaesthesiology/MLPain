@@ -1,0 +1,1141 @@
+# Setup ----
+library(readxl) 
+library(caret)
+library(dplyr) #For easier data wrangling
+library(kknn)
+library(pROC) #For calculating ROC
+library(randomForest)
+library(gbm)
+library(tidyr) 
+library(stringr)
+library(e1071)
+
+## Cleanup ----
+rm(list = ls()) #Remove any old data loaded
+graphics.off() #remove any old graphics loaded
+options(scipen = 999) # Changes p-values from scientific to numeric
+options(max.print = 1000000) # Makes you print a list w/o an upper limit. Otherwise might overload the computer
+
+## Libraries ----
+#IMPORT ALL DATA
+data = data.frame(read_xlsx('follow_up_data.xlsx'))
+
+#Clean data----
+## Removes variables with near zero variance ----
+nzv_data <- nearZeroVar(data)
+data <- data[,-(nzv_data)]
+rm(nzv_data)
+
+outcome <- "cpsp1" #For easily checking if the results were similar using slightly different definitions of CPSP. 
+## Subsets only the variables of interest ----
+protein_names <- colnames(data[,251:291]) #Defines all column names of protein before subsetting all variables of interest.
+data = data[,c(outcome,"hads_d","pcs_total","hads_a",
+               "ps","cci", "bpi4","optype_highest",
+               "cpm_score","tsp_score","pdt1","ptt1",protein_names)]
+data <- mutate_all(data, function(x) as.numeric(as.character(x)))
+
+## Makes the primary outcome a factor----
+data$cpsp1 <- as.factor(data[,c(outcome)])
+# To test other outcomes
+if (outcome != "cpsp1") {
+  data <- data[,!(names(data) %in% outcome)]
+  data <- data %>% relocate(cpsp1)
+}
+
+## Make a result data frame ----
+results <- data[,1:2]
+#This will be used later on for storing results from all the different models.
+
+# Model training ----
+## K-Nearest neighbors with all variables ----
+
+## Set the different K to test. K is restricted for computational efficiency.
+ks <- 1:60
+
+###Find K ----
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA) #A df for storing results of each trained model with different k's
+
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(cpsp1 ~ .,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }              
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_all <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)]
+
+### Train the leave-one-out-cross-validated model ----
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(cpsp1 ~ .,
+                train = train_data_test,
+                k=k_all[1], 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_all[i] <- model$prob[1,2]
+}
+
+## K-Nearest neighbors with variable selection with random forest----
+### Train Random forest ----
+#### Randomly subset test and training set ----
+n <- nrow(data)
+select  <- sample(c(TRUE, FALSE), n, replace = TRUE, prob = c(0.30, 0.70))
+train_data <- data[!select,]
+test_data <- data[select,]
+
+#### Find optimal mtry ----
+mtry <- tuneRF(data[,2:53],data[,1], ntreeTry=80,
+               stepFactor=1.2,improve=0.005,trace=TRUE,plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1][1]
+
+#### Train forest ----
+rf <-randomForest(cpsp1 ~ ., 
+                  data=train_data,
+                  mtry=best.m,
+                  importance=TRUE,
+                  ntree=80,
+                  classwt = c(10,1))
+
+#### Find the variables to be used in the KNN model ----
+varImpPlot(rf) #Plot the variable importance 
+imp<-importance(rf) #Define variables with their importance according to the RF
+variables_rf <- rownames(imp[imp[,3]>0,]) #All variables which contribute positively to the RF
+bestformula <- as.formula(paste("cpsp1 ~",paste(variables_rf, collapse ="+"),sep = "")) # Model formula the variables
+
+### Train KNN model with these variables ----
+#### Find K ----
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA)
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(bestformula,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_cv <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)][1]
+
+#### Train the LOOCV model ----
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(bestformula,
+                train = train_data_test,
+                k=k_cv, 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_rf[i] <- model$prob[1,2]
+}
+
+
+## Multiple logistic regression with backward elimination----
+#This function does backward elimination with p value of the predictors.
+elimination <- function(data,vector_of_predictors,outcome,exclusion_criteria) {
+  #Gives an error and exits the function if the outcome is not in the data frame 
+  if (!(exists(outcome, where = data))){
+    return(paste("Error, ",outcome," not found in data",sep = ""))
+  }
+  predictors_vector <- vector_of_predictors #defines as a new vector inside the function 
+  worst.Predictor.p = 1 #To make the while loop run later in the function. Will be overwritten
+  #Defining a dataframe to store performance of the model before a while loop for elimination
+  performance_df <<- data.frame( 
+    R.Squared = 0,
+    Adj.R.Squared = 0,
+    number.predictors = 0,
+    Worst.Predictor.name = "none",
+    Worst.Predictor.p = 0
+  )
+  iteration <- 1 #Iteration variable is used to input the steps of the elimination in the right place in the dataframe.
+  
+  while (worst.Predictor.p>exclusion_criteria) { #A new round of elimination will run if the worst performing predictor has a p value above the exclusion criteria
+    variable_string <- paste(predictors_vector, collapse ="+") #The vector of predictors is converted to a string suitable for the formula
+    formula_for_model <- as.formula(paste(outcome,"~",variable_string,sep = "")) 
+    predictionmodel <<- glm(formula_for_model, #The model is defined globally to be used in further analyses
+                            data = data, 
+                            family = "binomial",
+                            na.action = na.omit)
+    index <- order(coef(summary(predictionmodel))[,4])  # Finds the index of p values from lowest to highest
+    coefs <- summary(predictionmodel)$coefficients # Finds the variables in the model and their values
+    coefs <- data.frame(coefs[order(coefs[,4],decreasing = TRUE),]) # Sorts the variables in the model from least to most significant 
+    worst <- coefs[1,]
+    worst.Predictor.name <- row.names(worst)
+    worst.Predictor.p <- coefs[1,4]
+    #In case the intercept is the least significant variable in the model, takes the second least significant variable, because we cant remove the intercept.
+    if (worst.Predictor.name == "(Intercept)") {
+      worst <- coefs[2,]
+      worst.Predictor.name <- row.names(worst)
+      worst.Predictor.p <- coefs[2,4]
+    }
+    #Inputs all the data on model performance of elimination in a dataframa accessable (<<-) globally
+    performance_df <- performance_df %>% 
+      add_row(
+        R.Squared = summary(predictionmodel)$r.squared,
+        Adj.R.Squared = summary(predictionmodel)$adj.r.squared,
+        number.predictors = nrow(coefs)-1,
+        Worst.Predictor.name = worst.Predictor.name,
+        Worst.Predictor.p = worst.Predictor.p
+      )
+    predictors_vector <- predictors_vector[predictors_vector != worst.Predictor.name] #Removes the least significant variable
+    iteration <- iteration + 1 #Adds one to the iteration variable.
+  }
+  #Outputs the model summary and the performance dataframe.
+  print(summary(predictionmodel))
+  return(performance_df)
+}
+predictors <- colnames(data[c(2:53)])
+
+### Perform the backward elimination ----
+elimination(data=data,
+            vector_of_predictors = predictors,
+            outcome = "cpsp1",
+            exclusion_criteria = 0.157)
+
+#### LOOCV ----
+variables_log <- attr(predictionmodel$terms, "term.labels") #Fetches the variables from the model 
+glmformula <-as.formula(paste("cpsp1~",paste(variables_log, collapse ="+"),sep = ""))
+for(i in 1:nrow(data)) {
+  train_data_glm <- data[-i,]
+  model <- glm(glmformula,
+               data = train_data_glm,
+               family = "binomial")
+  results$prob_log_be[i] <- predict(model,data[i,])
+}
+
+## Gradient boost ----
+# Train the Gradient Boosting model
+gradient_data = data[,]
+
+gbm_model <- gbm(
+  formula = cpsp1 ~ .,
+  data = gradient_data, 
+  distribution = "gaussian", 
+  n.trees = 1000, 
+  interaction.depth = 4, 
+  shrinkage = 0.01, 
+  cv.folds = 3,
+  n.cores = 10
+)
+
+### LOOCV ----
+for(i in 1:nrow(data)) {
+  train_data_gbm <- data[-i,]
+  model = gbm(
+    formula = cpsp1 ~ ., 
+    data = train_data_gbm, 
+    distribution = "gaussian", 
+    n.trees = 5000, 
+    interaction.depth = 4, 
+    shrinkage = 0.01, 
+    cv.folds = 3,
+    n.cores= 10
+  )
+  cat(i,'\n')
+  results$prob_gbm_all[i] <- predict(model,data[i,])
+}
+
+## Naive Bayes model ----
+# Fitting Naive Bayes Model 
+classifier_cl <- naiveBayes(cpsp1 ~ ., data = data, laplace = 100)
+
+### LOOCV ----
+for(i in 1:nrow(data)) {
+  train_data_bayes <- data[-i,]
+  model <- naiveBayes(cpsp1 ~ ., data = train_data_bayes, laplace = 2)
+  cat(i,'\n')
+  results$prob_bayes_all[i] <- predict(model,data[i,],type = "raw")[,1]
+}
+
+results$prob_bayes_all <- results$prob_bayes_all
+
+# Domain specific analyses ----
+protein_model <- as.formula(cpsp1 ~ vegfa+cd8a+opg+lap.tgf.beta.1+upa+mcp.1+cxcl11+axin1+trail+cxcl9+cst5+cxcl1+ccl4+scf+il18+mcp.4+mmp.1+fgf.21+ ccl19+il.10rb+il.18r1+cxcl5+hgf+il.12b+mmp.10+ccl23+ccl3+flt3l+cxcl6+x4e.bp1+sirt2+dner+cd40+fgf.19+mcp.2+ccl25+tweak+ccl20+st1a1+stambp+csf.1)
+prom_model <- as.formula(cpsp1 ~ hads_d+pcs_total+hads_a)
+clinical_model <- as.formula(cpsp1 ~ ps+bpi4+optype_highest+cci)
+qst_model <- as.formula(cpsp1 ~ cpm_score+tsp_score+pdt1+ptt1)
+
+## K-Nearest neighbors----
+### Protein ----
+#### Find K
+#The optimal K is found by looping through every K from 1:70 and testing the LOOCV AUC 
+AUCs <- data.frame("k"=1:60,"AUC_cv"=NA, "AUCint"=NA)
+
+for(k in 1:60) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(protein_model,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  modelLoop <- kknn(protein_model, 
+                    train = data,
+                    k=k, 
+                    test = data, 
+                    scale = TRUE,
+                    kernel = "inv")
+  AUCs [paste0(k), "AUCint"] <- roc(results$cpsp1,modelLoop$prob[,2],
+                                    levels = c(0,1))$auc
+  print(k)
+}
+k_prot <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)]
+
+#### LOOCV
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(protein_model,
+                train = train_data_test,
+                k=k_prot[1], 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_prot[i] <- model$prob[1,2]
+}
+roc_test <- roc(results$cpsp1, results$prob_knn_prot)
+
+rocplot <- plot(roc_test,print.auc=TRUE, col = "blue",print.auc.y=0.2)
+
+### Prom ----
+AUCs <- data.frame("k"=1:60,"AUC_cv"=NA, "AUCint"=NA)
+
+#### Find k 
+for(k in 1:60) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(prom_model,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  modelLoop <- kknn(cpsp1  ~ hads_d+pcs_total+hads_a, 
+                    train = data,
+                    k=k, 
+                    test = data, 
+                    scale = TRUE,
+                    kernel = "inv")
+  AUCs [paste0(k), "AUCint"] <- roc(results$cpsp1,
+                                    modelLoop$prob[,2],
+                                    levels = c(0,1))$auc
+  print(k)
+}
+k_prom <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)]
+
+#### LOOCV 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(prom_model,
+                train = train_data_test,
+                k=k_prom[1], 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_prom[i] <- model$prob[1,2]
+}
+
+### Clinical----
+AUCs <- data.frame("k"=1:60,"AUC_cv"=NA, "AUCint"=NA)
+
+#### Find k 
+for(k in 1:60) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(clinical_model,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  modelLoop <- kknn(clinical_model,
+                    train = data,
+                    k=k, 
+                    test = data, 
+                    scale = TRUE,
+                    kernel = "inv")
+  AUCs [paste0(k), "AUCint"] <- roc(results$cpsp1,
+                                    modelLoop$prob[,2],
+                                    levels = c(0,1))$auc
+  print(k)
+}
+k_clin <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)]
+
+#### LOOCV 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(clinical_model, 
+                train = train_data_test,
+                k=k_clin[1], 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_clinical[i] <- model$prob[1,2]
+}
+
+### QST ----
+AUCs <- data.frame("k"=1:60,"AUC_cv"=NA, "AUCint"=NA)
+
+#### Find k 
+for(k in 1:60) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(qst_model,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  modelLoop <- kknn(qst_model, 
+                    train = data,
+                    k=k, 
+                    test = data, 
+                    scale = TRUE,
+                    kernel = "inv")
+  AUCs [paste0(k), "AUCint"] <- roc(results$cpsp1,
+                                    modelLoop$prob[,2],
+                                    levels = c(0,1))$auc
+  print(k)
+}
+k_qst <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)]
+
+#### LOOCV 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(qst_model,
+                train = train_data_test,
+                k=k_qst[1], 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_qst[i] <- model$prob[1,2]
+}
+
+## K-Nearest neighbors with variable selection with random forest----
+### Protein ----
+### Train Random forest 
+#### Randomly subset test and training set 
+n <- nrow(data)
+select  <- sample(c(TRUE, FALSE), n, replace = TRUE, prob = c(0.30, 0.70))
+train_data <- data[!select, ]
+test_data <- data[select, ]
+
+#### Find optimal mtry 
+mtry <- tuneRF(data[,13:53],data[,1], ntreeTry=80,
+               stepFactor=1.2,improve=0.005,trace=TRUE,plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1][1]
+
+#### Train forest 
+rf <-randomForest(protein_model,
+                  data=train_data,
+                  mtry=best.m,
+                  importance=TRUE,
+                  ntree=80,
+                  classwt = c(10,1))
+
+# Because of the variability of the random forest, the model can be saved and reused at a later time:
+#### Save random forest ---
+# saveRDS(rf,file="randomforrest7.RDS")
+
+#### Load the same model as was trained previously 
+#rf <- readRDS("model_publication.RDS")
+
+#### Find the variables to be used in the KNN model 
+varImpPlot(rf) #Plot the variable importance 
+imp<-importance(rf) #Define variables with their importance according to the RF
+vars_rf_prot <- rownames(imp[imp[,3]>0,]) #All variables which contribute positively to the RF
+bestformula <- as.formula(paste("cpsp1 ~",paste(vars_rf_prot, collapse ="+"),sep = "")) # Model formula the variables
+
+### Train KNN model with these variables 
+#### Find K 
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA)
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(bestformula,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_cv <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)][1]
+
+#### Train the LOOCV model 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(bestformula,
+                train = train_data_test,
+                k=k_cv, 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_rf_prot[i] <- model$prob[1,2]
+}
+### Prom ----
+### Train Random forest 
+#### Randomly subset test and training set 
+n <- nrow(data)
+select  <- sample(c(TRUE, FALSE), n, replace = TRUE, prob = c(0.30, 0.70))
+train_data <- data[!select, ]
+test_data <- data[select, ]
+
+#### Find optimal mtry 
+mtry <- tuneRF(data[,2:4],data[,1], ntreeTry=80,
+               stepFactor=1.2,improve=0.005,trace=TRUE,plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1][1]
+
+#### Train forest 
+rf <-randomForest(cpsp1  ~ hads_d+pcs_total+hads_a,
+                  data=train_data,
+                  mtry=best.m,
+                  importance=TRUE,
+                  ntree=80,
+                  classwt = c(10,1))
+
+# Because of the variability of the random forest, the model can be saved and reused at a later time:
+#### Save random forest 
+# saveRDS(rf,file="randomforrest7.RDS")
+
+#### Load the same model as was trained previously 
+#rf <- readRDS("model_publication.RDS")
+
+#### Find the variables to be used in the KNN model 
+varImpPlot(rf) #Plot the variable importance 
+imp<-importance(rf) #Define variables with their importance according to the RF
+imp <- as.data.frame(imp)
+vars_rf_prom <- rownames(imp[imp[,3]>0,]) #All variables which contribute positively to the RF
+bestformula <- as.formula(paste("cpsp1 ~",paste(vars_rf_prom, collapse ="+"),sep = "")) # Model formula the variables
+
+### Train KNN model with these variables 
+#### Find K 
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA)
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(bestformula,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_cv <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)][1]
+
+#### Train the LOOCV model 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(bestformula,
+                train = train_data_test,
+                k=k_cv, 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_rf_prom[i] <- model$prob[1,2]
+}
+### Clinical ----
+### Train Random forest 
+#### Randomly subset test and training set 
+n <- nrow(data)
+select  <- sample(c(TRUE, FALSE), n, replace = TRUE, prob = c(0.30, 0.70))
+train_data <- data[!select, ]
+test_data <- data[select, ]
+
+#### Find optimal mtry 
+mtry <- tuneRF(data[,5:8],data[,1], ntreeTry=80,
+               stepFactor=1.2,improve=0.005,trace=TRUE,plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1][1]
+
+#### Train forest 
+rf <-randomForest(cpsp1  ~ ps+bpi4+optype_highest+cci,
+                  data=train_data,
+                  mtry=best.m,
+                  importance=TRUE,
+                  ntree=80,
+                  classwt = c(10,1))
+
+# Because of the variability of the random forest, the model can be saved and reused at a later time:
+#### Save random forest ---
+# saveRDS(rf,file="randomforrest7.RDS")
+
+#### Load the same model as was trained previously 
+#rf <- readRDS("model_publication.RDS")
+
+#### Find the variables to be used in the KNN model 
+varImpPlot(rf) #Plot the variable importance 
+imp<-importance(rf) #Define variables with their importance according to the RF
+imp <- as.data.frame(imp)
+vars_rf_clinical <- rownames(imp[imp[,3]>0,]) #All variables which contribute positively to the RF
+bestformula <- as.formula(paste("cpsp1 ~",paste(vars_rf_clinical, collapse ="+"),sep = "")) # Model formula the variables
+
+### Train KNN model with these variables 
+#### Find K 
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA)
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(bestformula,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_cv <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)][1]
+
+#### Train the LOOCV model 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(bestformula,
+                train = train_data_test,
+                k=k_cv, 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_rf_clinical[i] <- model$prob[1,2]
+}
+### QST ----
+### Train Random forest 
+#### Randomly subset test and training set 
+n <- nrow(data)
+select  <- sample(c(TRUE, FALSE), n, replace = TRUE, prob = c(0.30, 0.70))
+train_data <- data[!select, ]
+test_data <- data[select, ]
+
+#### Find optimal mtry 
+mtry <- tuneRF(data[,9:12],data[,1], ntreeTry=80,
+               stepFactor=1.2,improve=0.005,trace=TRUE,plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1][1]
+
+#### Train forest 
+rf <-randomForest(cpsp1  ~ cpm_score+tsp_score+pdt1+ptt1,
+                  data=train_data,
+                  mtry=best.m,
+                  importance=TRUE,
+                  ntree=80,
+                  classwt = c(10,1))
+
+# Because of the variability of the random forest, the model can be saved and reused at a later time:
+#### Save random forest ---
+# saveRDS(rf,file="randomforrest7.RDS")
+
+#### Load the same model as was trained previously 
+#rf <- readRDS("model_publication.RDS")
+
+#### Find the variables to be used in the KNN model 
+varImpPlot(rf) #Plot the variable importance 
+imp<-importance(rf) #Define variables with their importance according to the RF
+imp <- as.data.frame(imp)
+vars_rf_qst <- rownames(imp[imp[,3]>0,]) #All variables which contribute positively to the RF
+bestformula <- as.formula(paste("cpsp1 ~",paste(vars_rf_qst, collapse ="+"),sep = "")) # Model formula the variables
+
+### Train KNN model with these variables 
+#### Find K 
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA)
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(bestformula,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_cv <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)][1]
+
+#### Train the LOOCV model 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(bestformula,
+                train = train_data_test,
+                k=k_cv, 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_rf_qst[i] <- model$prob[1,2]
+}
+
+### Combined ----
+selected_rf_vars <- c(vars_rf_prot,vars_rf_prom,vars_rf_clinical,vars_rf_qst)
+bestformula <- as.formula(paste("cpsp1 ~",paste(selected_rf_vars, collapse ="+"),sep = "")) # Model formula the variables
+
+### Train KNN model with these variables 
+#### Find K 
+AUCs <- data.frame("k"=ks,"AUC_cv"=NA)
+for(k in ks) {
+  for(i in 1:nrow(data)) {
+    train_data_test <- data[-i,]
+    test_data_test <- data[i,]
+    model <- kknn(bestformula,
+                  train = train_data_test,
+                  k=k, 
+                  test = test_data_test, 
+                  scale = TRUE,
+                  kernel = "inv")
+    results$prob[i] <- model$prob[1,2]
+  }
+  
+  AUCs[paste0(k), "k"] <- k
+  AUCs[paste0(k), "AUC_cv"] <- roc(results$cpsp1,
+                                   results$prob,
+                                   levels = c(0,1))$auc
+  print(k)
+}
+k_cv <- AUCs$k[AUCs$AUC_cv==max(AUCs$AUC_cv)][1]
+
+#### Train the LOOCV model 
+for(i in 1:nrow(data)) {
+  train_data_test <- data[-i,]
+  test_data_test <- data[i,]
+  
+  model <- kknn(bestformula,
+                train = train_data_test,
+                k=k_cv, 
+                test = test_data_test, 
+                scale = TRUE,
+                kernel = "inv")
+  results$prob_knn_rf_combined[i] <- model$prob[1,2]
+}
+
+## Logistic reg ----
+### Protein ----
+### Perform the backward elimination
+elimination(data=data,
+            vector_of_predictors = protein_names,
+            outcome = "cpsp1",
+            exclusion_criteria = 0.157)
+results$prob_log <- predict(predictionmodel,data)
+
+#### LOOCV 
+variables_log_prot <- attr(predictionmodel$terms, "term.labels") #Fetches the variables from the model 
+glmformula <-as.formula(paste("cpsp1~",paste(variables_log_prot, collapse ="+"),sep = ""))
+for(i in 1:nrow(data)) {
+  train_data_glm <- data[-i,]
+  model <- glm(glmformula,
+               data = train_data_glm,
+               family = "binomial")
+  results$prob_log_prot[i] <- predict(model,data[i,])
+}
+
+
+### Prom ----
+### Perform the backward elimination
+prom <- colnames(data[c(2:4)])
+# elimination(data=data,
+#             vector_of_predictors = prom,
+#             outcome = "cpsp1",
+#             exclusion_criteria = 0.157)
+#No model. Checks if any predictors are good:
+variable_string <- paste(prom, collapse ="+") #The vector of predictors is converted to a string suitable for the formula
+formula_for_model <- as.formula(paste("cpsp1 ~",variable_string,sep = "")) 
+# predictionmodel <<- glm(formula_for_model, #The model is defined globally to be used in further analyses
+#                         data = data, 
+#                         family = "binomial",
+#                         na.action = na.omit)
+summary(predictionmodel)
+results$prob_log_prom <- 0.5
+
+### Clinical ----
+### Perform the backward elimination
+clinical <- c("ps","cci", "bpi4","optype_highest")
+
+# elimination(data=data,
+#             vector_of_predictors = clinical,
+#             outcome = "cpsp1",
+#             exclusion_criteria = 0.157)
+
+#Does not produce a model with any predictors
+results$prob_log_clinical <- 0.5
+### Qst ----
+### Perform the backward elimination
+qst <- c("cpm_score","tsp_score","pdt1","ptt1")
+
+# elimination(data=data,
+#             vector_of_predictors = qst,
+#             outcome = "cpsp1",
+#             exclusion_criteria = 0.157)
+results$prob_log_qst <- 0.5
+
+### Combined ----
+# Same as only proteins. 
+
+## Gradient Boost ----
+### Protein ----
+for(i in 1:nrow(data)) {
+  train_data_gbm <- data[-i,]
+  model = gbm(
+    formula = protein_model, 
+    data = train_data_gbm, 
+    distribution = "gaussian", 
+    n.trees = 5000, 
+    interaction.depth = 4, 
+    shrinkage = 0.01, 
+    cv.folds = 3,
+    n.cores = 4
+  )
+  cat(i,'\n')
+  results$prob_gbm_protein[i] <- predict(model,data[i,])
+}
+### Prom ----
+for(i in 1:nrow(data)) {
+  train_data_gbm <- data[-i,1:53]
+  model = gbm(
+    formula = prom_model, 
+    data = train_data_gbm, 
+    distribution = "gaussian", 
+    n.trees = 5000, 
+    interaction.depth = 4, 
+    shrinkage = 0.01, 
+    cv.folds = 3,
+    n.cores = 4
+  )
+  cat(i,'\n')
+  results$prob_gbm_prom[i] <- predict(model,data[i,])
+}
+### Clinical ----
+for(i in 1:nrow(data)) {
+  train_data_gbm <- data[-i,1:53]
+  model = gbm(
+    formula = clinical_model, 
+    data = train_data_gbm, 
+    distribution = "gaussian", 
+    n.trees = 5000, 
+    interaction.depth = 4, 
+    shrinkage = 0.01, 
+    cv.folds = 3,
+    n.cores = 4
+  )
+  cat(i,'\n')
+  results$prob_gbm_clinical[i] <- predict(model,data[i,])
+}
+### QST ----
+for(i in 1:nrow(data)) {
+  train_data_gbm <- data[-i,1:53]
+  model = gbm(
+    formula = qst_model, 
+    data = train_data_gbm, 
+    distribution = "gaussian", 
+    n.trees = 5000, 
+    interaction.depth = 4, 
+    shrinkage = 0.01, 
+    cv.folds = 3,
+    n.cores = 4
+  )
+  cat(i,'\n')
+  results$prob_gbm_qst[i] <- predict(model,data[i,])
+}
+
+## Naive Bayes ----
+### Protein ----
+for(i in 1:nrow(data)) {
+  train_data_bayes <- data[-i,]
+  model <- naiveBayes(protein_model, data = train_data_bayes)
+  cat(i,'\n')
+  results$prob_bayes_protein[i] <- predict(model,data[i,],type = "raw")[,1]
+}
+
+### Prom ----
+for(i in 1:nrow(data)) {
+  train_data_bayes <- data[-i,]
+  model <- naiveBayes(prom_model, data = train_data_bayes)
+  cat(i,'\n')
+  results$prob_bayes_prom[i] <- predict(model,data[i,],type = "raw")[,1]
+}
+
+### Clinical ----
+for(i in 1:nrow(data)) {
+  train_data_bayes <- data[-i,]
+  model <- naiveBayes(clinical_model, data = train_data_bayes)
+  cat(i,'\n')
+  results$prob_bayes_clinical[i] <- predict(model,data[i,],type = "raw")[,1]
+}
+### QST ----
+for(i in 1:nrow(data)) {
+  train_data_bayes <- data[-i,]
+  model <- naiveBayes(qst_model, data = train_data_bayes)
+  cat(i,'\n')
+  results$prob_bayes_qst[i] <- predict(model,data[i,],type = "raw")[,1]
+}
+
+### No proteins ----
+for(i in 1:nrow(data)) {
+  train_data_bayes <- data[-i,1:12]
+  model <- naiveBayes(cpsp1~., data = train_data_bayes)
+  cat(i,'\n')
+  results$prob_bayes_port[i] <- predict(model,data[i,],type = "raw")[,1]
+}
+
+# Models evaluations ----
+## receiver operating characteristic ----
+### Calculate ROC for all models ----
+roc_knn_all <- roc(results$cpsp1, results$prob_knn_all)
+roc_knn_rf <- roc(results$cpsp1, results$prob_knn_rf)
+roc_log_be <- roc(results$cpsp1, results$prob_log_be)
+roc_gbm_all <- roc(results$cpsp1, results$prob_gbm_all)
+roc_bayes_all <- roc(results$cpsp1, results$prob_bayes_all)
+
+## Accuracy ----
+### Finding optimal cuts of all five models using the youden point ----
+threshold_knn_all <- coords(roc_knn_all, "best", "threshold")[[1]]
+threshold_knn_rf <- coords(roc_knn_rf, "best", "threshold")[[1]]
+threshold_log_be <- coords(roc_log_be, "best", "threshold")[[1]]
+threshold_gbm_all <- coords(roc_gbm_all, "best", "threshold")[[1]]
+threshold_bayes_all <- coords(roc_bayes_all, "best", "threshold")[[1]]
+
+### Predictions using these cuts ----
+results$predictions_of_knn_all <- ifelse(results$prob_knn_all > threshold_knn_all,"0","1")
+results$predictions_of_knn_rf <- ifelse(results$prob_knn_rf > threshold_knn_rf,"0","1")
+results$predictions_of_log_be <- ifelse(results$prob_log_be > threshold_log_be,"1","0")
+results$predictions_of_gbm_all <- ifelse(results$prob_gbm_all > threshold_gbm_all,"0","1")
+results$predictions_of_bayes_all <- ifelse(results$prob_bayes_all > threshold_bayes_all,"1","0")
+
+### Confusion matrices ----
+confuse_knn_all <- confusionMatrix(as.factor(results$predictions_of_knn_all),results$cpsp1)
+confuse_knn_rf <- confusionMatrix(as.factor(results$predictions_of_knn_rf),results$cpsp1)
+confuse_log_be <- confusionMatrix(as.factor(results$predictions_of_log_be),results$cpsp1)
+confuse_gbm_all <- confusionMatrix(as.factor(results$predictions_of_gbm_all),results$cpsp1)
+confuse_bayes_all <- confusionMatrix(as.factor(results$predictions_of_bayes_all),results$cpsp1)
+
+### As a table ----
+accuracy_table <- data.frame(rbind("knn_all"=c(confuse_knn_all$byClass,confuse_knn_all$overall)))
+accuracy_table <- rbind(accuracy_table,"knn_rf"=c(confuse_knn_rf$byClass,confuse_knn_rf$overall))
+accuracy_table <- rbind(accuracy_table,"log_be"=c(confuse_log_be$byClass,confuse_log_be$overall))
+accuracy_table <- rbind(accuracy_table,"gbm_all"=c(confuse_gbm_all$byClass,confuse_gbm_all$overall))
+accuracy_table <- rbind(accuracy_table,"bayes_all"=c(confuse_bayes_all$byClass,confuse_bayes_all$overall))
+
+## Cohen's Kappa between each set ---- 
+
+### The three main models ---- 
+# the number of columns of "out" is from mathematics
+predictions <- results[,c(1,9,10,11,12,13)]
+out <- as.data.frame(matrix(0, nrow = ncol(predictions), ncol = ncol(predictions)))
+rownames(out) <- str_remove(colnames(predictions),"predictions_of_")
+colnames(out) <- str_remove(colnames(predictions),"predictions_of_")
+out2 <- out
+rownames(out2) <- c("CPSP", "KNN All", "KNN RF", "Logistic","Gradient Boost", "Naive Bayes")
+colnames(out2) <- c("CPSP", "KNN All", "KNN RF", "Logistic","Gradient Boost", "Naive Bayes")
+out <- out2
+# cycle out2# cycle for calculation kappa
+for (i in 1:(ncol(predictions))){
+  for (j in 1:ncol(predictions)){
+    out[i,j] <- irr::kappa2(predictions[,c(i,j)])$value
+  }
+}
+
+# Pivot the matrix into a long format
+kappa_long <- out %>%
+  pivot_longer(cols= everything(),names_to = "model1",values_to = "kappa")
+kappa_long$model2 <- rep(rownames(out), each = ncol(out))
+
+kappa_long %>%
+  ggplot(aes(model1,model2,fill = kappa))+
+  geom_tile()+   
+  geom_text(aes(label = round(kappa, 2))) + 
+  scale_fill_gradient(low = "white", high = "darkblue")+
+  xlab("")+
+  ylab("")
+
+## IRR ----
+library(irr)
+
+kappam.fleiss(results[,c(9,10,11,12,13)]) #The five models
+kappam.fleiss(results[,c(1,9,10,12,13)]) #The five models and truth
+
+## C stats ----
+library(DescTools)
+cstat <- as.data.frame(matrix(0, nrow = ncol(predictions), ncol = ncol(predictions)))
+rownames(cstat) <- str_remove(colnames(predictions),"predictions_of_")
+colnames(cstat) <- str_remove(colnames(predictions),"predictions_of_")
+
+# cycle for calculation kappa
+for (i in 1:(ncol(predictions))){
+  for (j in 1:ncol(predictions)){
+    cstat[i,j] <- Cstat(predictions[,i],predictions[,j])
+    cstat[i,j] <- ifelse(cstat[i,j]<=0.5,1-cstat[i,j],cstat[i,j])
+  }
+}
+
+# Pivot the matrix into a long format
+cstat_long <- cstat %>%
+  pivot_longer(cols= everything(),names_to = "model1",values_to = "cstat")
+cstat_long$model2 <- rep(rownames(cstat), each = ncol(cstat))
+
+cstat_long %>%
+  ggplot(aes(model1,model2,fill = cstat))+
+  geom_tile()+   
+  geom_text(aes(label = round(cstat, 2))) + 
+  scale_fill_gradient(low = "white", high = "darkblue")
+
+# Models evaluations ----
+## receiver operating characteristic ----
+### Calculate ROC for all models ----
+#### ROC KNN ----
+roc_knn_all <- roc(results$cpsp1, results$prob_knn_all)
+roc_knn_prot <- roc(results$cpsp1, results$prob_knn_prot)
+roc_knn_prom <- roc(results$cpsp1, results$prob_knn_prom)
+roc_knn_clinical <- roc(results$cpsp1, results$prob_knn_clinical)
+roc_knn_qst <- roc(results$cpsp1, results$prob_knn_qst)
+
+#### ROC KNN RF ----
+roc_knn_rf_all <- roc(results$cpsp1, results$prob_knn_rf)
+roc_knn_rf_prot <- roc(results$cpsp1, results$prob_knn_rf_prot)
+roc_knn_rf_prom <- roc(results$cpsp1, results$prob_knn_rf_prom)
+roc_knn_rf_clinical <- roc(results$cpsp1, results$prob_knn_rf_clinical)
+roc_knn_rf_qst <- roc(results$cpsp1, results$prob_knn_rf_qst)
+
+#### ROC Log ----
+roc_log_all <- roc(results$cpsp1, results$prob_log_be)
+roc_log_prot <- roc(results$cpsp1, results$prob_log_prot)
+roc_log_prom <- roc(results$cpsp1, results$prob_log_prom)
+roc_log_clinical <- roc(results$cpsp1, results$prob_log_clinical)
+roc_log_qst <- roc(results$cpsp1, results$prob_log_qst)
+
+#### ROC gbm ----
+roc_gbm_all <- roc(results$cpsp1, results$prob_gbm_all)
+roc_gbm_prot <- roc(results$cpsp1, results$prob_gbm_prot)
+roc_gbm_prom <- roc(results$cpsp1, results$prob_gbm_prom)
+roc_gbm_clinical <- roc(results$cpsp1, results$prob_gbm_clinical)
+roc_gbm_qst <- roc(results$cpsp1, results$prob_gbm_qst)
+
+#### ROC bayes ----
+roc_bayes_all <- roc(results$cpsp1, results$prob_bayes_all)
+roc_bayes_prot <- roc(results$cpsp1, results$prob_bayes_prot)
+roc_bayes_prom <- roc(results$cpsp1, results$prob_bayes_prom)
+roc_bayes_clinical <- roc(results$cpsp1, results$prob_bayes_clinical)
+roc_bayes_qst <- roc(results$cpsp1, results$prob_bayes_qst)
+
+models_summary <- data.frame(Type= c("KNN"),Model = c("All"),AUC = c(roc_knn_all$auc))
+models_summary <- rbind(models_summary,c("KNN", "Proteins", roc_knn_prot$auc))
+models_summary <- rbind(models_summary,c("KNN", "Questionnaires", roc_knn_prom$auc))
+models_summary <- rbind(models_summary,c("KNN", "Clinical", roc_knn_clinical$auc))
+models_summary <- rbind(models_summary,c("KNN", "QST", roc_knn_qst$auc))
+
+models_summary <- rbind(models_summary,c("KNN RF", "All", roc_knn_rf_all$auc))
+models_summary <- rbind(models_summary,c("KNN RF", "Proteins", roc_knn_rf_prot$auc))
+models_summary <- rbind(models_summary,c("KNN RF", "Questionnaires", roc_knn_rf_prom$auc))
+models_summary <- rbind(models_summary,c("KNN RF", "Clinical", roc_knn_rf_clinical$auc))
+models_summary <- rbind(models_summary,c("KNN RF", "QST", roc_knn_rf_qst$auc))
+
+models_summary <- rbind(models_summary,c("Logistic", "All", roc_log_all$auc))
+models_summary <- rbind(models_summary,c("Logistic", "Proteins", roc_log_prot$auc))
+models_summary <- rbind(models_summary,c("Logistic", "Questionnaires", roc_log_prom$auc))
+models_summary <- rbind(models_summary,c("Logistic", "Clinical", roc_log_clinical$auc))
+models_summary <- rbind(models_summary,c("Logistic", "QST", roc_log_qst$auc))
+
+models_summary <- rbind(models_summary,c("Gradient Boost","All", roc_gbm_all$auc))
+models_summary <- rbind(models_summary,c("Gradient Boost", "Proteins", roc_gbm_prot$auc))
+models_summary <- rbind(models_summary,c("Gradient Boost", "Questionnaires", roc_gbm_prom$auc))
+models_summary <- rbind(models_summary,c("Gradient Boost", "Clinical", roc_gbm_clinical$auc))
+models_summary <- rbind(models_summary,c("Gradient Boost", "QST", roc_gbm_qst$auc))
+
+models_summary <- rbind(models_summary,c("Naive Bayes", "All", roc_bayes_all$auc))
+models_summary <- rbind(models_summary,c("Naive Bayes", "Proteins", roc_bayes_prot$auc))
+models_summary <- rbind(models_summary,c("Naive Bayes", "Questionnaires", roc_bayes_prom$auc))
+models_summary <- rbind(models_summary,c("Naive Bayes", "Clinical", roc_bayes_clinical$auc))
+models_summary <- rbind(models_summary,c("Naive Bayes", "QST", roc_bayes_qst$auc))
